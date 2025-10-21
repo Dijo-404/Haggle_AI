@@ -1,0 +1,7 @@
+# Required dependencies for the project
+streamlit
+requests
+faster-whisper
+streamlit-webrtc
+# Optional dependencies
+whisper
