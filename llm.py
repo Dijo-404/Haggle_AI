@@ -1,229 +1,367 @@
-import os
-import time
-import requests
 import json
-from typing import Dict, Any, Optional
-from dotenv import load_dotenv
-from tenacity import retry, stop_after_attempt, wait_exponential
+import random
+from typing import Dict, Any
 from pydantic import ValidationError
-from schemas import VendorResponse
 
-# Load environment variables
-load_dotenv()
+from llm import LLMWrapper
+from prompts import SYSTEM_PROMPT, PROPOSAL_PROMPT, VENDOR_SIMULATION_PROMPT, FALLBACK_TEMPLATES
+from schemas import NegotiationProposal, VendorResponse
 
-def _with_retry(fn):
-    def wrapper(*args, **kwargs):
-        delays = [0.5, 1.0, 2.0]
-        last_err = None
-        for i in range(len(delays) + 1):
-            try:
-                return fn(*args, **kwargs)
-            except Exception as e:
-                last_err = e
-                if i < len(delays):
-                    print(f"[LLM RETRY] attempt {i + 1} failed: {e}. sleeping {delays[i]}s")
-                    time.sleep(delays[i])
-        raise last_err
-    return wrapper
-
-class LLMWrapper:
+class NegotiationAgent:
     """
-    Wrapper class to handle both Ollama and OpenAI API calls
-    Engine selection controlled by .env file
+    Core negotiation agent that generates proposals and simulates vendor responses
     """
-
-    def __init__(self):
-        self.engine = os.getenv("ENGINE", "ollama").lower()
-        
-        if self.engine == "openai":
-            try:
-                import openai
-                self.openai_client = openai.OpenAI(
-                    api_key=os.getenv("OPENAI_API_KEY")
-                )
-                self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-            except ImportError:
-                raise Exception("OpenAI library not installed. Run: pip install openai")
-                
-        elif self.engine == "ollama":
-            self.ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
-            self.model = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
-            
-            # Test Ollama connection
-            self._test_ollama_connection()
-        else:
-            raise ValueError(f"Unsupported engine: {self.engine}. Use 'openai' or 'ollama'")
     
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-    @_with_retry
-    def generate(self, system_prompt: str, user_prompt: str, temperature: float = 0.7) -> str:
+    def __init__(self):
+        self.llm = LLMWrapper()
+    
+    def generate_proposals(self, context: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
         """
-        Generate text using the configured LLM engine with retry logic.
+        Generate three different negotiation proposals: polite, firm, and term_swap
         
         Args:
-            system_prompt: System/role prompt
-            user_prompt: User's actual prompt
-            temperature: Sampling temperature (0.0 to 1.0)
+            context: Dictionary containing vendor_message, past_price, target_price, etc.
             
         Returns:
-            Generated text response
+            Dictionary with three proposal types, each containing content and reasoning
         """
         
-        if self.engine == "openai":
-            response = self._generate_openai(system_prompt, user_prompt, temperature)
-        elif self.engine == "ollama":
-            response = self._generate_ollama(system_prompt, user_prompt, temperature)
-        else:
-            raise ValueError(f"Unknown engine: {self.engine}")
-
-        # Validate response against VendorResponse schema
-        try:
-            if isinstance(response, str):
-                return response  # Return the string response directly
-            else:
-                parsed_response = VendorResponse.model_validate_json(response)
-            return parsed_response.response  # Return the validated response
-        except (json.JSONDecodeError, ValidationError):
-            raise Exception("Invalid JSON response from LLM.")
-    
-    @_with_retry
-    def _generate_openai(self, system_prompt: str, user_prompt: str, temperature: float) -> str:
-        """Generate using OpenAI API"""
+        context_str = self._format_context(context)
+        proposals = {}
+        strategies = ["polite", "firm", "term_swap"]
         
-        try:
-            response = self.openai_client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=temperature,
-                max_tokens=2000
+        for strategy in strategies:
+            proposals[strategy] = self._generate_single_proposal(
+                strategy, 
+                context_str, 
+                context
             )
-            raw_response = response.choices[0].message.content.strip()
-            print(f"[LLM RESPONSE] Raw response: {raw_response}")  # Log the raw response
-            return raw_response
-            
-        except Exception as e:
-            raise Exception(f"OpenAI API error: {str(e)}")
+        
+        return proposals
     
-    @_with_retry
-    def _generate_ollama(self, system_prompt: str, user_prompt: str, temperature: float) -> str:
-        """Generate using local Ollama"""
+    def _generate_single_proposal(
+        self, 
+        strategy: str, 
+        context_str: str, 
+        context: Dict[str, Any]
+    ) -> Dict[str, str]:
+        """Generate a single proposal with retry logic and fallback"""
         
-        try:
-            # Combine system and user prompts for Ollama
-            combined_prompt = f"System: {system_prompt}\n\nUser: {user_prompt}\n\nAssistant:"
-            
-            payload = {
-                "model": self.model,
-                "prompt": combined_prompt,
-                "stream": False,
-                "options": {
-                    "temperature": temperature,
-                    "num_predict": 2000
-                }
-            }
-            
-            response = requests.post(
-                f"{self.ollama_url}/api/generate",
-                json=payload,
-                timeout=60
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                raw_response = result["response"].strip()
-                print(f"[LLM RESPONSE] Raw response: {raw_response}")  # Log the raw response
-                return raw_response
-            else:
-                raise Exception(f"Ollama API returned status {response.status_code}: {response.text}")
-                
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"Ollama connection error: {str(e)}")
-        except Exception as e:
-            raise Exception(f"Ollama generation error: {str(e)}")
-    
-    def _test_ollama_connection(self):
-        """Test if Ollama is running and has the required model"""
-        
-        try:
-            # Check if Ollama is running
-            response = requests.get(f"{self.ollama_url}/api/tags", timeout=5)
-            
-            if response.status_code != 200:
-                raise Exception(f"Ollama server not responding (status {response.status_code})")
-            
-            # Check if the required model exists
-            models = response.json()
-            model_names = [model["name"] for model in models.get("models", [])]
-            
-            if self.model not in model_names:
-                raise Exception(
-                    f"Model '{self.model}' not found in Ollama. "
-                    f"Available models: {', '.join(model_names) if model_names else 'None'}. "
-                    f"Run: ollama pull {self.model}"
-                )
-                
-        except requests.exceptions.RequestException:
-            raise Exception(
-                f"Cannot connect to Ollama at {self.ollama_url}. "
-                "Make sure Ollama is running with: ollama serve"
-            )
-    
-    def get_engine_info(self) -> Dict[str, str]:
-        """Get information about the current engine configuration"""
-        
-        info = {
-            "engine": self.engine,
-            "model": self.model
-        }
-        
-        if self.engine == "ollama":
-            info["url"] = self.ollama_url
-        
-        return info
-    
-    def list_available_models(self) -> list:
-        """List available models for the current engine"""
-        
-        if self.engine == "ollama":
-            try:
-                response = requests.get(f"{self.ollama_url}/api/tags", timeout=5)
-                if response.status_code == 200:
-                    models = response.json()
-                    return [model["name"] for model in models.get("models", [])]
-            except:
-                pass
-            return []
-            
-        elif self.engine == "openai":
-            # Common OpenAI models - could be extended to fetch from API
-            return ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"]
-        
-        return []
-
-# Utility functions for quick testing
-def test_connection():
-    """Test the LLM connection with a simple prompt"""
-    
-    try:
-        llm = LLMWrapper()
-        response = llm.generate(
-            system_prompt="You are a helpful assistant.",
-            user_prompt="Say hello and confirm you're working."
+        prompt = PROPOSAL_PROMPT.format(
+            context=context_str,
+            strategy=strategy,
+            past_price=context["past_price"],
+            target_price=context["target_price"]
         )
         
-        print(f"✅ {llm.engine.upper()} connection successful!")
-        print(f"Model: {llm.model}")
-        print(f"Response: {response}")
+        # First attempt
+        try:
+            raw = self.llm.generate(
+                system_prompt=SYSTEM_PROMPT,
+                user_prompt=prompt,
+                temperature=0.65
+            )
+            return self._parse_proposal(raw)
+        except (json.JSONDecodeError, ValidationError) as e:
+            print(f"[PROPOSAL PARSE ERROR] {strategy} first attempt failed: {e}")
+        except Exception as e: # Catch other LLM or network errors
+            print(f"[PROPOSAL LLM ERROR] {strategy} first attempt failed: {e}")
+            
+        # Second attempt with stricter instructions if first one failed
+        print(f"[PROPOSAL INFO] Retrying {strategy} with a stricter prompt.")
+        try:
+            strict_prompt = prompt + "\n\nIMPORTANT: Return ONLY valid JSON with keys: proposal, reasoning, expected_outcome. No other text."
+            
+            raw = self.llm.generate(
+                system_prompt=SYSTEM_PROMPT,
+                user_prompt=strict_prompt,
+                temperature=0.6
+            )
+            return self._parse_proposal(raw)
+            
+        except (json.JSONDecodeError, ValidationError, Exception) as e2:
+            print(f"[PROPOSAL ERROR] {strategy} second attempt failed: {e2}. Using fallback.")
+            return self._get_fallback_proposal(strategy, context)
+    
+    def _parse_proposal(self, raw: str) -> Dict[str, str]:
+        """Parse and validate proposal JSON"""
         
-        return True
+        # Clean the raw string to remove potential markdown code blocks
+        clean_json_str = raw.strip().replace("```json", "").replace("```", "").strip()
+        data = json.loads(clean_json_str)
         
+        # Validate with Pydantic schema
+        obj = NegotiationProposal(**data)
+        
+        return {
+            "content": obj.proposal,
+            "reasoning": obj.reasoning,
+            "expected_outcome": obj.expected_outcome
+        }
+    
+    def simulate_vendor_response(
+        self, 
+        context: Dict[str, Any], 
+        selected_proposal: Dict[str, str]
+    ) -> Dict[str, Any]:
+        """
+        Simulate how a vendor might respond to the selected proposal
+        
+        Args:
+            context: Original negotiation context
+            selected_proposal: The proposal that was selected
+            
+        Returns:
+            Dictionary containing vendor response and accepted price
+        """
+        
+        prompt = VENDOR_SIMULATION_PROMPT.format(
+            vendor_message=context["vendor_message"],
+            proposal=selected_proposal["content"],
+            original_price=context["past_price"],
+            target_price=context["target_price"],
+            service_type=context["service_type"],
+            relationship=context["relationship"]
+        )
+        
+        # First attempt
+        try:
+            raw = self.llm.generate(
+                system_prompt="You are simulating a vendor's response to a negotiation. Be realistic and consider business factors.",
+                user_prompt=prompt,
+                temperature=0.5
+            )
+            return self._parse_vendor_response(raw)
+        except (json.JSONDecodeError, ValidationError) as e:
+            print(f"[VENDOR SIM PARSE ERROR] First attempt failed: {e}")
+        except Exception as e:
+            print(f"[VENDOR SIM LLM ERROR] First attempt failed: {e}")
+            
+        # Second attempt with stricter instructions
+        print("[VENDOR SIM INFO] Retrying with a stricter prompt.")
+        try:
+            strict_prompt = prompt + "\n\nIMPORTANT: Return ONLY valid JSON with keys: response, accepted_price, reasoning, success. No other text."
+            
+            raw = self.llm.generate(
+                system_prompt="You are simulating a vendor's response to a negotiation. Be realistic and consider business factors.",
+                user_prompt=strict_prompt,
+                temperature=0.45
+            )
+            return self._parse_vendor_response(raw)
+            
+        except (json.JSONDecodeError, ValidationError, Exception) as e2:
+            print(f"[VENDOR SIM ERROR] Second attempt failed: {e2}. Using fallback.")
+            return self._get_fallback_vendor_response(context)
+    
+    def _parse_vendor_response(self, raw: str) -> Dict[str, Any]:
+        """Parse and validate vendor response JSON"""
+        
+        # Clean the raw string to remove potential markdown code blocks
+        clean_json_str = raw.strip().replace("```json", "").replace("```", "").strip()
+        data = json.loads(clean_json_str)
+        
+        # Validate with Pydantic schema
+        obj = VendorResponse(**data)
+        
+        return {
+            "content": obj.response,
+            "accepted_price": obj.accepted_price,
+            "reasoning": obj.reasoning,
+            "success": obj.success
+        }
+    
+    def _format_context(self, context: Dict[str, Any]) -> str:
+        """Format context information for the LLM"""
+        return f"""
+<vendor_message>{context['vendor_message']}</vendor_message>
+<current_price>${context['past_price']}/month</current_price>
+<target_price>${context['target_price']}/month</target_price>
+<service_type>{context['service_type']}</service_type>
+<relationship_length>{context['relationship']}</relationship_length>
+"""
+    
+    def _get_fallback_proposal(self, strategy: str, context: Dict[str, Any]) -> Dict[str, str]:
+        """Generate dynamic fallback proposals when LLM fails"""
+        
+        target_price = context.get('target_price', 'a more competitive rate')
+        
+        templates = FALLBACK_TEMPLATES.get(strategy, FALLBACK_TEMPLATES['polite'])
+        
+        content = (
+            f"{templates['opening']}. {templates['transition']}, "
+            f"{templates['ask']} around ${target_price}/month. {templates['closing']}."
+        )
+        
+        return {
+            "content": content,
+            "reasoning": f"Using {strategy} approach with fallback template due to LLM error.",
+            "expected_outcome": "Vendor is likely to be receptive to a discussion."
+        }
+    
+    def _get_fallback_vendor_response(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate a dynamic fallback vendor response when simulation fails"""
+        
+        original_price = context.get("past_price", 1000)
+        target_price = context.get("target_price", 800)
+        
+        # Simulate a realistic concession (25-75% of requested discount)
+        requested_discount = original_price - target_price
+        actual_discount = requested_discount * random.uniform(0.25, 0.75)
+        accepted_price = round(original_price - actual_discount, 2)
+        
+        response_text = (
+            f"Thank you for your proposal. After reviewing our options, "
+            f"we can offer a revised rate of ${accepted_price}/month. "
+            f"This reflects our commitment to our partnership while maintaining "
+            f"our service quality standards."
+        )
+        
+        return {
+            "content": response_text,
+            "accepted_price": accepted_price,
+            "reasoning": "Fallback simulation: partial concession based on typical vendor behavior.",
+            "success": accepted_price < original_price
+        }
+    
+    def get_engine_info(self) -> Dict[str, str]:
+        """Get information about the current LLM engine"""
+        return self.llm.get_engine_info()
+
+
+class DebateOrchestrator:
+    """
+    Orchestrates debates between different negotiation strategies (STRETCH GOAL)
+    """
+    
+    def __init__(self):
+        self.llm = LLMWrapper()
+    
+    def conduct_debate(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Have polite and firm agents debate, then pick the best strategy
+        
+        Args:
+            context: Negotiation context
+            
+        Returns:
+            Best strategy recommendation with reasoning
+        """
+        
+        debate_prompt = f"""
+You are orchestrating a debate between two negotiation experts:
+
+POLITE AGENT POSITION:
+- Relationship-building leads to long-term success
+- Collaborative language builds trust and goodwill
+- Win-win solutions create lasting partnerships
+- Aggressive tactics can backfire and damage relationships
+
+FIRM AGENT POSITION:
+- Clear boundaries establish respect and credibility
+- Market leverage should be used when available
+- Direct communication saves time and shows confidence
+- Vendors respect customers who know their value
+
+CONTEXT:
+{self._format_debate_context(context)}
+
+Have each agent make their case, then recommend the optimal strategy for this situation.
+
+Return JSON format:
+{{
+    "polite_argument": "Key points for collaborative approach",
+    "firm_argument": "Key points for direct approach",
+    "recommendation": "polite|firm|hybrid",
+    "reasoning": "Why this approach is best for this situation"
+}}
+"""
+        
+        try:
+            response = self.llm.generate(
+                system_prompt="You are a negotiation strategy orchestrator conducting an expert debate.",
+                user_prompt=debate_prompt,
+                temperature=0.7
+            )
+            
+            clean_response = response.strip().replace("```json", "").replace("```", "").strip()
+            data = json.loads(clean_response)
+            return data
+            
+        except (json.JSONDecodeError, Exception) as e:
+            print(f"[DEBATE ERROR] {e}. Using fallback recommendation.")
+            return self._get_fallback_debate_response()
+
+    def _get_fallback_debate_response(self) -> Dict[str, str]:
+        """Returns a default recommendation when the debate LLM call fails."""
+        return {
+            "polite_argument": "Building relationships leads to long-term success and repeat business.",
+            "firm_argument": "Clear boundaries establish respect and better outcomes in negotiations.",
+            "recommendation": "polite",
+            "reasoning": "Defaulting to a collaborative approach to preserve the relationship due to a debate generation error."
+        }
+
+    def _format_debate_context(self, context: Dict[str, Any]) -> str:
+        """Format context for debate prompt"""
+        return f"""
+- Service: {context.get('service_type', 'Unknown')}
+- Current Price: ${context.get('past_price', 0)}/month
+- Target Price: ${context.get('target_price', 0)}/month
+- Relationship: {context.get('relationship', 'Unknown')}
+- Vendor Message: {context.get('vendor_message', 'N/A')[:200]}...
+"""
+
+
+# Utility function for testing
+def test_agent():
+    """Test the agent with a sample negotiation"""
+    
+    agent = NegotiationAgent()
+    
+    test_context = {
+        "vendor_message": "Your renewal is coming up at $1000/month for the Pro plan.",
+        "past_price": 500,
+        "target_price": 400,
+        "service_type": "SaaS Subscription",
+        "relationship": "1-3 Years"
+    }
+    
+    print("=" * 60)
+    print("TESTING NEGOTIATION AGENT")
+    print("=" * 60)
+    
+    # Test proposal generation
+    print("\n1. Generating proposals...")
+    try:
+        proposals = agent.generate_proposals(test_context)
+        print("Proposals generated successfully!")
+        
+        for strategy, proposal in proposals.items():
+            print(f"\n{strategy.upper()}:")
+            print(f"  Content: {proposal['content'][:100]}...")
+            print(f"  Reasoning: {proposal['reasoning'][:100]}...")
     except Exception as e:
-        print(f"❌ Connection failed: {str(e)}")
+        print(f"Proposal generation failed: {e}")
         return False
+    
+    # Test vendor simulation
+    print("\n2. Simulating vendor response...")
+    try:
+        selected = proposals['polite']
+        response = agent.simulate_vendor_response(test_context, selected)
+        print("Vendor response simulated successfully!")
+        print(f"  Accepted Price: ${response['accepted_price']}/month")
+        print(f"  Success: {response['success']}")
+    except Exception as e:
+        print(f"Vendor simulation failed: {e}")
+        return False
+    
+    print("\n" + "=" * 60)
+    print("ALL TESTS PASSED!")
+    print("=" * 60)
+    
+    return True
+
 
 if __name__ == "__main__":
-    # Test the connection when run directly
-    test_connection()
+    test_agent()
+
