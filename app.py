@@ -1,7 +1,9 @@
 try:
-    from whisper import Whisper
-except ImportError as e:
-    raise ImportError("Whisper library not found. Please install it.") from e
+    from services.email import GmailClient
+    GMAIL_AVAILABLE = True
+except ImportError:
+    GMAIL_AVAILABLE = False
+    st.warning("Gmail integration not available")
 
 import os
 import streamlit as st
